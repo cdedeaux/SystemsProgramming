@@ -1,0 +1,6 @@
+#include <hdrs.h>
+#include <myutils.h>
+
+
+read the program 2 in as unsigned characters
+unsigned char

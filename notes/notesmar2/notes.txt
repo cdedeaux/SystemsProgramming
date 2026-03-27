@@ -1,0 +1,9 @@
+wait and wait pid wait for child terminatino status to update
+
+if before the child terminates the parent waits
+if after it returns the process id of the terminated child
+
+pthread join waits for a thread to terminate and gives return status
+
+if still active it blocks until terminated
+it returns the data

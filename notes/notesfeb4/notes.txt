@@ -1,0 +1,17 @@
+use sigs to send signals
+block delivery by adding to process signal mask
+pending signals are masked, thats how they get blocked
+cannot mask segmentation violation sig kill 
+
+sigprocmask
+signals only go though when unblocked
+kernel doenst know how many times a standard signal is blocked
+
+sigaction is the new portable solution for signal writing and setting
+you can set old act to null
+
+do not use sleep and timer at the same time or alarm
+if you need to use it, use nanosleep()
+
+if it_value is 0 the timer is disabled
+if it_interval is 0 the timer triggers once

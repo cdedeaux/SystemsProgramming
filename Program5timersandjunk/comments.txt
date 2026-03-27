@@ -1,0 +1,285 @@
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <inttypes.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <string.h>
+#include <time.h>
+#include <dirent.h>
+#include <termios.h>
+#include <sys/time.h>
+#include <signal.h>
+
+aaaa
+int checkError(int val, const char *msg){
+    if(val == -1){
+        perror(msg);
+        exit(EXIT_FAILURE);
+    }
+    return val;
+}
+
+/*
+ * signalHandler() - Handler for SIGALRM (timer expiration).
+ *
+ * WHY: When the 15-second timer expires, the kernel sends SIGALRM to this process.
+ * We need a handler registered or the default action (process termination) would
+ * kill the program.
+ *
+ * HOW: The handler intentionally does nothing. Its only purpose is to EXIST so that:
+ *   1. The process isn't killed by the default SIGALRM disposition.
+ *   2. The signal interrupts the blocking read() call in main(), causing it to
+ *      return -1 with errno == EINTR. Main then checks for EINTR to know
+ *      the user ran out of time.
+ *
+ * NOTE: sa_flags is set to 0 (no SA_RESTART), which is critical. If SA_RESTART
+ * were set, the kernel would automatically restart the interrupted read() and
+ * the timeout would never be detected.
+ */
+void signalHandler(int signum){
+    if(signum == SIGALRM){
+        /* Intentionally empty — the signal delivery itself is what matters */
+    }
+}
+
+/*
+ * signalHandler2() - Handler for SIGINT (Ctrl+C).
+ *
+ * WHY: Gives the user a graceful way to quit mid-quiz instead of just killing
+ * the process. This is friendlier and could be extended to show final scores.
+ *
+ * HOW:
+ *   1. Cancels any running timer by setting it to zero (prevents a SIGALRM
+ *      from firing while we're waiting for the y/n response).
+ *   2. Prompts the user and reads one character.
+ *   3. If 'y', exits cleanly. Otherwise, returns and the program continues
+ *      from wherever it was interrupted.
+ */
+void signalHandler2(int signum){
+    /* Zero out the timer so SIGALRM doesn't fire while we're in this handler */
+    struct itimerval zeroTimer = {0};
+    setitimer(ITIMER_REAL, &zeroTimer, NULL);
+
+    printf("\nExit (y/n)?\n");
+    char response;
+    read(STDIN_FILENO, &response, 1);
+    if(response == 'y' || response == 'Y'){
+        printf("Exiting quiz.\n");
+        exit(EXIT_SUCCESS);
+    } else {
+        printf("Continuing quiz.\n");
+    }
+}
+
+int main(){
+    const char *filepath = "text.txt";
+
+    /*
+     * Open the quiz text file using low-level I/O (not fopen).
+     * O_RDONLY = read-only. Returns a file descriptor (small integer).
+     * checkError will abort if the file doesn't exist.
+     */
+    int fd = checkError(open(filepath, O_RDONLY), "open");
+
+    char buffer[100];
+    ssize_t bytesRead;
+
+    /*
+     * Configure the interval timer (ITIMER_REAL).
+     *
+     * ITIMER_REAL counts down in real (wall-clock) time and sends SIGALRM
+     * when it reaches zero.
+     *
+     * it_value    = initial countdown (15 seconds)
+     * it_interval = repeat interval (0 = one-shot, doesn't auto-repeat)
+     *
+     * We don't arm it here — we arm it right before each read() in the loop.
+     */
+    struct itimerval timer;
+    struct itimerval remainingTime;
+    timer.it_value.tv_sec = 15;
+    timer.it_value.tv_usec = 0;
+    timer.it_interval.tv_sec = 0;
+    timer.it_interval.tv_usec = 0;
+
+    int totalTime = 0; /* Accumulated "bonus" seconds (time remaining on correct answers) */
+
+    /*
+     * Register signal handlers using sigaction (preferred over signal()).
+     *
+     * WHY sigaction over signal():
+     * - sigaction gives explicit control over flags (like SA_RESTART)
+     * - signal() behavior varies across systems; sigaction is portable/predictable
+     * - sigemptyset ensures no other signals are blocked during handler execution
+     *
+     * sa_flags = 0 is KEY for SIGALRM: it means read() will NOT be auto-restarted
+     * after the signal, so read() returns -1/EINTR and we can detect the timeout.
+     */
+    struct sigaction sa;
+    sa.sa_handler = signalHandler;
+    sigemptyset(&sa.sa_mask);  /* Don't block additional signals in the handler */
+    sa.sa_flags = 0;           /* Do NOT restart interrupted syscalls */
+    sigaction(SIGALRM, &sa, NULL);
+
+    struct sigaction sa_int;
+    sa_int.sa_handler = signalHandler2;
+    sigemptyset(&sa_int.sa_mask);
+    sa_int.sa_flags = 0;
+    sigaction(SIGINT, &sa_int, NULL);
+
+    /* Prompt to start */
+    printf("This is a timed typing quiz\nYou will have 15 seconds to type the text\nPress Ctrl+C to exit the quiz\nDo you want to start? (y/n): \n");
+    char start;
+    read(STDIN_FILENO, &start, 1);
+    if (start != 'y' && start != 'Y') {
+        printf("Exiting quiz.\n");
+        close(fd);
+        exit(EXIT_SUCCESS);
+    }
+
+    /* Visual countdown to let the user prepare */
+    for (int i = 0; i < 3; i++) {
+        printf("Get ready... %d\n", 3 - i);
+        sleep(1);
+    }
+
+    /*
+     * Main read loop — reads chunks from the file.
+     *
+     * WHY read() instead of fgets():
+     * - Consistent with the low-level I/O approach used throughout
+     * - Reads up to 99 bytes at a time (leaving room for null terminator)
+     * - Returns 0 when EOF is reached, ending the loop
+     *
+     * Each chunk may contain multiple lines. The inner loop processes
+     * character-by-character, accumulating each line in currentLine[]
+     * and triggering the typing prompt when a newline is encountered.
+     */
+    while ((bytesRead = read(fd, buffer, sizeof(buffer) - 1)) > 0) {
+        buffer[bytesRead] = '\0';
+        char currentLine[100]; /* Accumulates the current line's characters */
+        int lineIn = 0;        /* Index into currentLine */
+
+        for (int i = 0; i < bytesRead; i++) {
+            /*
+             * Print "Type the following line:" at the start of each new line.
+             * Detected by: i==0 (start of buffer) or previous char was newline.
+             */
+            if (i==0 || buffer[i-1] == '\n') {
+                printf("Type the following line:\n");
+            }
+
+            /* Display the file content one character at a time */
+            write(1, &buffer[i], 1);
+            
+            /*
+             * Build up currentLine by copying non-newline characters.
+             * \r and \n are excluded — they're line terminators, not content.
+             * currentLine will be used later to compare against user input.
+             */
+            if (buffer[i] != '\n' && buffer[i] != '\r') {
+                currentLine[lineIn++] = buffer[i];
+            } else {
+                currentLine[lineIn] = '\0';
+            }
+
+            /*
+             * When we hit a newline, one complete line has been displayed.
+             * Now it's the user's turn to type it.
+             */
+            if (buffer[i] == '\n') {
+                /* Handle Windows-style \r\n line endings by stripping the \r */
+                if(buffer[i-1] == '\r'){
+                    buffer[i-1] = '\0';
+                }
+
+                /*
+                 * ARM THE TIMER: Start the 15-second countdown.
+                 * setitimer(ITIMER_REAL, ...) starts a real-time timer that
+                 * will send SIGALRM when it expires.
+                 */
+                setitimer(ITIMER_REAL, &timer, NULL);
+                
+                /*
+                 * BLOCKING READ: Wait for user input.
+                 *
+                 * Two possible outcomes:
+                 * 1. User types something and presses Enter → read returns bytes
+                 * 2. Timer expires → SIGALRM fires → signalHandler runs (does nothing)
+                 *    → read() is interrupted → returns -1 with errno == EINTR
+                 *
+                 * We save errno immediately because subsequent calls (like
+                 * getitimer) could overwrite it.
+                 */
+                char input[100];
+                ssize_t inputBytes = read(0, input, sizeof(input) - 1);
+                int savedErrno = errno;
+
+                /*
+                 * Query how much time was left on the timer.
+                 * This is used to calculate the user's speed bonus.
+                 */
+                getitimer(ITIMER_REAL, &remainingTime);
+
+                /*
+                 * DISARM THE TIMER: Whether the user typed in time or not,
+                 * cancel the timer so it doesn't fire unexpectedly later.
+                 */
+                struct itimerval zeroTimer = {0};
+                setitimer(ITIMER_REAL, &zeroTimer, NULL);
+
+                if (inputBytes == -1 && savedErrno == EINTR) {
+                    /*
+                     * TIMEOUT PATH: read() was interrupted by SIGALRM.
+                     *
+                     * errno == EINTR means "interrupted by signal" — this is how
+                     * we distinguish a timeout from an actual I/O error.
+                     *
+                     * We use write() instead of printf() here because write()
+                     * is async-signal-safe (safe to use near signal handling).
+                     * Then cleanIO() waits for the user to acknowledge before
+                     * moving to the next line.
+                     */
+                    write(STDOUT_FILENO, "Time has elapsed\n", 17);
+                    cleanIO();
+                } 
+                else {
+                    /*
+                     * SUCCESS PATH: User typed something before timeout.
+                     *
+                     * Get the remaining seconds — this becomes the score for
+                     * this line (faster typing = more remaining time = higher score).
+                     */
+                    int remainingSec = remainingTime.it_value.tv_sec;
+                    input[inputBytes] = '\0'; /* Null-terminate the input */
+
+                    /* Strip trailing newline from the user's input (from pressing Enter) */
+                    if (input[inputBytes - 1] == '\n') {
+                        input[inputBytes - 1] = '\0';
+                    }
+
+                    /*
+                     * Compare user input to the expected line.
+                     * strcmp returns 0 if they're identical (case-sensitive, exact match).
+                     */
+                    if (strcmp(input, currentLine) == 0) {
+                        printf("Correct! You typed the line correctly. (%d seconds remaining)\n", remainingSec);
+                        totalTime += (remainingSec); /* Add remaining time as score bonus */
+                    } 
+                    else {
+                        printf("Incorrect. The correct line was: %s\n", currentLine);
+                        /* No score penalty — just no bonus */
+                    }
+                }
+                lineIn = 0; /* Reset for the next line */
+            }
+        }
+        /* Print running total after each buffer chunk */
+        printf("Total score : %d \n", totalTime);
+    }
+
+    return 0;
+}

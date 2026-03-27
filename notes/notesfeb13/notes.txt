@@ -1,0 +1,2 @@
+read newlines char by char for Project 5. must read to the line feed to get to \n. 
+ctrl + C pauses time. prints remaining time to show, also allow it to start again at the leftoff
